@@ -8,6 +8,7 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import pickle
+import numpy as np
 import sys
 from pathlib import Path
 
@@ -15,12 +16,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from ai_explain import generate_briefing, explain_shipment
+from whatif import whatif_seller_swap, load_artifacts, FEATURE_COLS
 
 SHAP_PATH  = ROOT / "data" / "shap_values.parquet"
 CACHE_PATH = ROOT / "data" / "explanations_cache.parquet"
 MODEL_PATH = ROOT / "models" / "lgbm_model.pkl"
 
-RISK_THRESHOLD = 0.70
+RISK_THRESHOLD = 0.25
 
 st.set_page_config(
     page_title="Dispatch Risk Intelligence",
@@ -28,11 +30,38 @@ st.set_page_config(
     layout="wide",
 )
 
+class LGBMWrapper:
+    _estimator_type = "classifier"
+
+    def __init__(self, booster):
+        self.booster = booster
+        self.classes_ = np.array([0, 1])
+
+    def predict_proba(self, X):
+        probs = self.booster.predict(X)
+        return np.column_stack([1 - probs, probs])
+
+    def fit(self, X, y):
+        self.classes_ = np.array([0, 1])
+        return self
+
+
 # ── Data loading ──────────────────────────────────────────────────────────────
 
 @st.cache_data
 def load_shap_data():
-    return pd.read_parquet(SHAP_PATH)
+    df = pd.read_parquet(SHAP_PATH)
+    if "route" not in df.columns:
+        df["route"] = df["seller_state"] + "_" + df["customer_state"]
+    return df
+
+@st.cache_data
+def load_features_data():
+    path = ROOT / "data" / "features_df.parquet"
+    df = pd.read_parquet(path)
+    if "route" not in df.columns:
+        df["route"] = df["seller_state"] + "_" + df["customer_state"]
+    return df
 
 @st.cache_data
 def load_cache():
@@ -48,7 +77,7 @@ def load_model():
 def risk_label(score):
     if score >= RISK_THRESHOLD:
         return "High"
-    elif score >= 0.40:
+    elif score >= 0.12:
         return "Medium"
     else:
         return "Low"
@@ -56,13 +85,25 @@ def risk_label(score):
 def risk_color(label):
     return {"High": "🔴", "Medium": "🟡", "Low": "🟢"}.get(label, "")
 
+
 # ── Load ──────────────────────────────────────────────────────────────────────
 
-df        = load_shap_data()
-cached_df = load_cache()
-artifact  = load_model()
+df          = load_shap_data()
+features_df = load_features_data()
+cached_df   = load_cache()
+artifact    = load_model()
+
+# Join missing feature cols from features_df into shap df
+missing_cols = [c for c in FEATURE_COLS if c not in df.columns]
+if missing_cols:
+    df = df.merge(
+        features_df[["order_id"] + missing_cols],
+        on="order_id",
+        how="left"
+    )
 
 df["risk_label"] = df["risk_score"].apply(risk_label)
+
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
@@ -74,6 +115,7 @@ page = st.sidebar.radio(
     ["Morning Briefing", "Risk Table", "Shipment Drilldown"]
 )
 
+
 # ── Page 1: Morning Briefing ──────────────────────────────────────────────────
 
 if page == "Morning Briefing":
@@ -81,15 +123,17 @@ if page == "Morning Briefing":
     st.markdown("AI-generated summary of today's shipment risk landscape.")
     st.markdown("---")
 
-    high_risk = df[df["risk_score"] >= RISK_THRESHOLD]
-    medium_risk = df[(df["risk_score"] >= 0.40) & (df["risk_score"] < RISK_THRESHOLD)]
-    low_risk = df[df["risk_score"] < 0.40]
+    high_risk   = df[df["risk_score"] >= RISK_THRESHOLD]
+    medium_risk = df[(df["risk_score"] >= 0.12) & (df["risk_score"] < RISK_THRESHOLD)]
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Shipments", f"{len(df):,}")
-    col2.metric("High Risk", f"{len(high_risk):,}", delta=f"{len(high_risk)/len(df)*100:.1f}% of queue", delta_color="inverse")
+    col2.metric("High Risk", f"{len(high_risk):,}",
+                delta=f"{len(high_risk)/len(df)*100:.1f}% of queue",
+                delta_color="inverse")
     col3.metric("Medium Risk", f"{len(medium_risk):,}")
-    col4.metric("Actually Delayed", f"{int(df['is_delayed'].sum()):,}", help="Ground truth — orders that were actually late")
+    col4.metric("Actually Delayed", f"{int(df['is_delayed'].sum()):,}",
+                help="Ground truth — orders that were actually late")
 
     st.markdown("---")
     st.subheader("AI Briefing")
@@ -221,7 +265,7 @@ elif page == "Risk Table":
 
 elif page == "Shipment Drilldown":
     st.title("Shipment Drilldown")
-    st.markdown("Select a shipment to see its risk breakdown and AI explanation.")
+    st.markdown("Select a shipment to see its risk breakdown, AI explanation, and what-if analysis.")
     st.markdown("---")
 
     top_orders = df.nlargest(10, "risk_score").reset_index(drop=True)
@@ -231,9 +275,9 @@ elif page == "Shipment Drilldown":
         " | " + top_orders["order_id"]
     ).tolist()
 
-    selected = st.selectbox("Select shipment (top 10 by risk)", order_options)
+    selected    = st.selectbox("Select shipment (top 10 by risk)", order_options)
     selected_id = selected.split(" | ")[1]
-    row = top_orders[top_orders["order_id"] == selected_id].iloc[0]
+    row         = top_orders[top_orders["order_id"] == selected_id].iloc[0]
 
     st.markdown("---")
     col1, col2, col3, col4 = st.columns(4)
@@ -243,6 +287,8 @@ elif page == "Shipment Drilldown":
     col4.metric("Est. Delivery Days", f"{int(row.get('estimated_days', 0))}")
 
     st.markdown("---")
+
+    # ── SHAP + AI explanation ─────────────────────────────────────────────────
     col1, col2 = st.columns([1, 1])
 
     with col1:
@@ -289,12 +335,71 @@ elif page == "Shipment Drilldown":
         st.markdown("---")
         st.markdown("**Order details**")
         details = {
-            "Order ID":             row["order_id"],
-            "Category":             row.get("product_category_en", "N/A"),
-            "Route delay rate":     f"{row['route_delay_rate']*100:.1f}%",
-            "Avg last mile (days)": round(row.get("route_avg_lastmile_days", 0), 2),
-            "Avg pickup lag (days)":round(row.get("seller_avg_pickup_days", 0), 2),
-            "Actually delayed?":    "Yes" if row["is_delayed"] == 1 else "No",
+            "Order ID":              row["order_id"],
+            "Category":              row.get("product_category_en", "N/A"),
+            "Route delay rate":      f"{row['route_delay_rate']*100:.1f}%",
+            "Avg last mile (days)":  round(row.get("route_avg_lastmile_days", 0), 2),
+            "Avg pickup lag (days)": round(row.get("seller_avg_pickup_days", 0), 2),
+            "Actually delayed?":     "Yes" if row["is_delayed"] == 1 else "No",
         }
         for label, val in details.items():
             st.markdown(f"**{label}:** {val}")
+
+    # ── What-if: Seller swap ──────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("What-If: Seller Swap")
+    st.markdown(
+        "Shows how delay risk changes if this order were fulfilled by alternative sellers "
+        "on the same route. All scores are based on real historical performance data."
+    )
+
+    with st.spinner("Running what-if analysis..."):
+        seller_results = whatif_seller_swap(row, artifact, features_df)
+
+    if seller_results.empty:
+        st.info("No alternative sellers found on this route with enough order history (minimum 5 orders).")
+    else:
+        current = seller_results.iloc[0]
+        alternatives = seller_results.iloc[1:]
+
+        # Summary recommendation
+        best = alternatives.loc[alternatives["predicted_risk"].idxmin()]
+        reduction = abs(best["risk_change"])
+        st.success(
+            f"Best alternative: **{best['label']}** — switches risk from "
+            f"**{current['predicted_risk']}%** to **{best['predicted_risk']}%** "
+            f"({reduction:.1f}% relative reduction). "
+            f"Based on {best['total_orders']} real orders on this route."
+        )
+
+        # Comparison table
+        display = seller_results.copy()
+        display["predicted_risk"] = display["predicted_risk"].astype(str) + "%"
+        display["historical_delay_rate"] = display["historical_delay_rate"].astype(str) + "%"
+        display["risk_change"] = display["risk_change"].apply(
+            lambda x: f"—" if x == 0 else (f"▼ {abs(x):.1f}% lower" if x < 0 else f"▲ {x:.1f}% higher")
+        )
+        display["total_orders"] = display["total_orders"].fillna("—")
+
+        st.dataframe(
+            display[[
+                "label", "historical_delay_rate", "avg_pickup_days",
+                "avg_lastmile_days", "total_orders",
+                "predicted_risk", "risk_change"
+            ]].rename(columns={
+                "label":                 "Seller",
+                "historical_delay_rate": "Delay rate",
+                "avg_pickup_days":       "Avg pickup (days)",
+                "avg_lastmile_days":     "Avg last mile (days)",
+                "total_orders":          "Orders on route",
+                "predicted_risk":        "Predicted risk",
+                "risk_change":           "vs current",
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.caption(
+            "Predicted risk uses raw model scores for relative comparison. "
+            "Dashboard risk scores use calibrated probabilities."
+        )
