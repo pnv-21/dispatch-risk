@@ -54,8 +54,8 @@ This system scores every shipment in the morning queue for delay risk **before d
 | Metric | Value |
 |---|---|
 | Algorithm | LightGBM binary classifier |
-| ROC-AUC | 0.66 |
-| Recall (delayed class) | 70% |
+| ROC-AUC | 0.76 |
+| Recall (delayed class) | 80% |
 | Calibration | Isotonic regression |
 | Split method | Temporal (chronological) |
 | Top features | Route avg last mile days, estimated delivery window, seller avg pickup days, route delay rate |
