@@ -18,9 +18,9 @@ This system scores every shipment in the morning queue for delay risk **before d
 - LightGBM binary classifier trained on historical shipment data
 - Temporal train/test split — no data leakage, model only learns from past orders
 - Class imbalance handled with `scale_pos_weight`
-- Decision threshold tuned for 70% recall — catching real delays matters more than avoiding false positives
+- Decision threshold tuned for 80% recall — catching real delays matters more than avoiding false positives
 - Isotonic calibration so risk scores reflect real probabilities
-- ROC-AUC: 0.66 on held-out test set
+- ROC-AUC: 0.76 on held-out test set
 
 **Explainability**
 - SHAP values computed per shipment using `TreeExplainer`
