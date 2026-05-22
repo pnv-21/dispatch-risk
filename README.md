@@ -92,9 +92,6 @@ pip install -r requirements.txt
 # Build features and train model
 python src/train.py
 
-# Start Ollama (required for AI explanations)
-ollama serve
-
 # Launch dashboard
 streamlit run app/streamlit_app.py
 ```
